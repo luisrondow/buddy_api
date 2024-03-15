@@ -2,55 +2,123 @@ package main
 
 import (
 	"context"
+	"encoding/csv"
 	"fmt"
+	"log"
 	"net/http"
 	"os"
 	"strings"
+	"time"
 
+	firebase "firebase.google.com/go"
 	"github.com/joho/godotenv"
 	"github.com/labstack/echo/v4"
 	openai "github.com/sashabaranov/go-openai"
+	"google.golang.org/api/option"
 )
 
+const (
+	DefaultPrompt       = "You are an assistant helping an user enroll in a Digital Physical therapy program."
+	DefaultAskMorePrompt = "At least, if there is any inconclusive answer, ask the user for this inconclusive information."
+)
+
+type NeedAnswer struct {
+	Key  string `json:"key"`
+	Value string `json:"value"`
+	PossibleValues []string `json:"possible_values"`
+}
+
 type Response struct {
-	ExpectedQuestions []string   `json:"expected_questions"`
-	Pattern           []string `json:"pattern"`
+	NeededAnswers 	[]NeedAnswer `json:"needed_answers"`
 	Text              string   `json:"text"`
 }
 
-func buildPossibleAnswersPrompt(possibleAnswers []string) string {
-	formattedPossibleAnswers := make([]string, len(possibleAnswers))
+type SuggestedAnswer struct {
+	Key   string `json:"key"`
+	Value any `json:"value"`
+}
 
-	for i, answer := range possibleAnswers {
-		formattedPossibleAnswers[i] = fmt.Sprintf("'%s'", answer)
+
+func csvStringToObject(csvString string) []any {
+	fmt.Println(csvString)
+    reader := csv.NewReader(strings.NewReader(csvString))
+    reader.FieldsPerRecord = -1 // see the Reader struct information below
+    csvData, err := reader.ReadAll()
+    if err != nil {
+		fmt.Println(err)
+        return nil
+    }
+
+    ans := make([]any, (len(csvData) / 2) - 1)
+
+    for i, each := range csvData {
+		if i == 0 {
+			continue
+		}
+
+		ans = append(ans, each[1])
+    }
+
+    return ans
+}
+
+func joinValue(a []NeedAnswer, s string) string {
+	if len(s) == 1 {
+		return a[0].Value
 	}
 
-	return fmt.Sprintf("A: {%s}", strings.Join(formattedPossibleAnswers, "or "))
+
+	var sb strings.Builder
+	for i, v := range a {
+		if i > 0 {
+			sb.WriteString(s)
+		}
+		sb.WriteString(v.Value)
+	}
+	return sb.String()
 }
 
-func buildPrompt(expectedQuestions string, pattern string) string {
-	return fmt.Sprintf("Based on the user response, answer those following questions: %s\n\n Strict follow this pattern in your response, only answers with what is inside the curly brackets: %s", expectedQuestions, pattern)
+func getPattern(s []NeedAnswer) []string {
+	var pattern []string
+	for _, v := range s {
+		if len(v.PossibleValues) > 0 {
+			pattern = append(pattern, strings.Join(v.PossibleValues, " OR "))
+		}
+	}
+	return pattern
 }
 
-func getOpenAI(apiKey, baseUrl, expectedQuestions, text, pattern string) string {
-	clientConfig := openai.DefaultAzureConfig(apiKey, baseUrl)
+func processQuestionPrompt(expectedQuestions, text string, pattern []string) []openai.ChatCompletionMessage {
+	var sb strings.Builder
 
-	client := openai.NewClientWithConfig(clientConfig)
+	prompt := fmt.Sprintf("%s You will be provided with the user's response and you will have extract the answer for the following questions:\n\n'%s'\n\nFor the response, create a two column CSV with question name and answer.:", DefaultPrompt, expectedQuestions)
 
+	if len(pattern) > 0 {
+		for i, p := range pattern {
+			sb.WriteString(fmt.Sprintf("\nFor the %d question, answer with one of these answer options: %s\n", i+1, p))
+		}
+
+		prompt = prompt + sb.String()
+	}
+
+	return []openai.ChatCompletionMessage{
+		{
+			Role:   openai.ChatMessageRoleSystem,
+			Content: prompt,
+		},
+		{
+			Role:    openai.ChatMessageRoleUser,
+			Content: text,
+		},
+	}
+}
+
+func getOpenAI(client *openai.Client, messages []openai.ChatCompletionMessage) string {
 	resp, err := client.CreateChatCompletion(
 		context.Background(),
 		openai.ChatCompletionRequest{
 			Model: openai.GPT3Dot5Turbo,
-			Messages: []openai.ChatCompletionMessage{
-				{
-					Role:   openai.ChatMessageRoleSystem,
-					Content: buildPrompt(expectedQuestions, pattern),
-				},
-				{
-					Role:    openai.ChatMessageRoleUser,
-					Content: text,
-				},
-			},
+			Messages: messages,
 		},
 	)
 
@@ -65,26 +133,82 @@ func getOpenAI(apiKey, baseUrl, expectedQuestions, text, pattern string) string 
 func main() {
 	err := godotenv.Load()
 	if err != nil {
-		fmt.Println("Error loading .env file")
-		return
+		log.Fatal("Error loading .env file")
 	}
 
 	apiKey := os.Getenv("API_KEY")
-	baseURL := os.Getenv("BASE_URL")
+	baseUrl := os.Getenv("BASE_URL")
 
 	e := echo.New()
 
-	e.POST("/process", func(c echo.Context) error {
+	ctx := context.Background()
+	sa := option.WithCredentialsFile("./sword-buddy.json")
+	app, err := firebase.NewApp(ctx, nil, sa)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	client, err := app.Firestore(ctx)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer client.Close()
+
+	e.GET("/health-check", func(c echo.Context) error {
+		return c.String(http.StatusOK, "ok!")
+	})
+
+	e.POST("/process/:enrollment_id", func(c echo.Context) error {
 		response := new(Response)
 
 		if err := c.Bind(response); err != nil {
 			return err
 		}
 
-		result := getOpenAI(apiKey, baseURL, response.ExpectedQuestions[0], response.Text, buildPossibleAnswersPrompt(response.Pattern))
+		enrollmentID := c.Param("enrollment_id")
 
-		return c.String(http.StatusCreated, result)
+		clientConfig := openai.DefaultAzureConfig(apiKey, baseUrl)
+
+		openaiClient := openai.NewClientWithConfig(clientConfig)
+
+		result := getOpenAI(openaiClient, processQuestionPrompt(joinValue(response.NeededAnswers, "\n"), response.Text, getPattern(response.NeededAnswers)))
+
+		cvH := ConversationHistory{
+			EnrollmentID: enrollmentID,
+			History: []History{
+				{
+					CreatedAt: time.Now(),
+					GptOutput: result,
+					UserInput: response.Text,
+				},
+			},
+		}
+
+		saveHistory(ctx, client, cvH)
+
+		gptParsedAnswers := csvStringToObject(result)
+
+		fmt.Printf("GPT Parsed Answers: %v\n", gptParsedAnswers)
+
+		suggestedAnswers := make([]SuggestedAnswer, len(response.NeededAnswers))
+
+		for i, v := range response.NeededAnswers {
+			suggestedAnswers[i] = SuggestedAnswer{
+				Key:   v.Key,
+				Value: gptParsedAnswers[i],
+			}
+		}
+
+		rsp := struct {
+			SuggestedAnswers []SuggestedAnswer `json:"suggested_answers"`
+			Text 		   string            `json:"text"`
+		}{
+			SuggestedAnswers: suggestedAnswers,
+			Text:             "Perfect, it's all for now. Can we go to the next step?",
+		}
+
+		return c.JSON(http.StatusOK, rsp)
 	})
 
-	e.Logger.Fatal(e.Start(":1323"))
+	e.Logger.Fatal(e.Start(":8080"))
 }
